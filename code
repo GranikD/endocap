@@ -1,0 +1,456 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+from torchvision import models
+import numpy as np
+from PIL import Image
+import os
+import matplotlib.pyplot as plt
+from sklearn.metrics import classification_report, confusion_matrix
+import seaborn as sns
+
+
+# ============================================================================
+# 1. Класс для датасета
+# ============================================================================
+class CapsuleEndoscopyDataset(Dataset):
+    """
+    Датсет изображений эндоскопической капсулы
+    Предполагаем структуру папок:
+    data/
+        train/
+            tumor/
+                img1.jpg, img2.jpg, ...
+            normal/
+                img1.jpg, img2.jpg, ...
+        test/
+            tumor/
+            normal/
+    """
+
+    def __init__(self, root_dir, transform=None, mode='train'):
+        self.root_dir = os.path.join(root_dir, mode)
+        self.transform = transform
+        self.images = []
+        self.labels = []
+
+        # Классы: 0 - норма, 1 - опухоль
+        self.classes = ['normal', 'tumor']
+
+        for class_idx, class_name in enumerate(self.classes):
+            class_dir = os.path.join(self.root_dir, class_name)
+            if os.path.exists(class_dir):
+                for img_name in os.listdir(class_dir):
+                    if img_name.lower().endswith(('.png', '.jpg', '.jpeg')):
+                        self.images.append(os.path.join(class_dir, img_name))
+                        self.labels.append(class_idx)
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img_path = self.images[idx]
+        image = Image.open(img_path).convert('RGB')
+        label = self.labels[idx]
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, label
+
+
+# ============================================================================
+# 2. Архитектура модели
+# ============================================================================
+class TumorDetectorCNN(nn.Module):
+    """
+    CNN для детекции опухолей в кишечнике
+    """
+
+    def __init__(self, num_classes=2, use_pretrained=True):
+        super(TumorDetectorCNN, self).__init__()
+
+        # Используем предобученную модель (EfficientNet)
+        self.model = models.efficientnet_b0(pretrained=use_pretrained)
+
+        # Заменяем классификатор
+        num_features = self.model.classifier[1].in_features
+        self.model.classifier = nn.Sequential(
+            nn.Dropout(p=0.3),
+            nn.Linear(num_features, 512),
+            nn.ReLU(),
+            nn.Dropout(p=0.2),
+            nn.Linear(512, num_classes)
+        )
+
+        # Или создаем собственную архитектуру
+        self.custom_cnn = nn.Sequential(
+            # Слой 1
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            # Слой 2
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            # Слой 3
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            # Глобальный пулинг
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+
+            # Полносвязные слои
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(64, num_classes)
+        )
+
+        self.use_pretrained = use_pretrained
+
+    def forward(self, x):
+        if self.use_pretrained:
+            return self.model(x)
+        else:
+            return self.custom_cnn(x)
+
+
+# ============================================================================
+# 3. Функции для обучения
+# ============================================================================
+def train_epoch(model, dataloader, criterion, optimizer, device):
+    """Одна эпоха обучения"""
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    for batch_idx, (inputs, labels) in enumerate(dataloader):
+        inputs, labels = inputs.to(device), labels.to(device)
+
+        # Обнуляем градиенты
+        optimizer.zero_grad()
+
+        # Прямой проход
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+
+        # Обратный проход
+        loss.backward()
+        optimizer.step()
+
+        # Статистика
+        running_loss += loss.item()
+        _, predicted = outputs.max(1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+
+        if batch_idx % 50 == 0:
+            print(f'  Batch {batch_idx}/{len(dataloader)}, Loss: {loss.item():.4f}')
+
+    epoch_loss = running_loss / len(dataloader)
+    epoch_acc = 100. * correct / total
+
+    return epoch_loss, epoch_acc
+
+
+def validate(model, dataloader, criterion, device):
+    """Валидация модели"""
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+
+            running_loss += loss.item()
+            _, predicted = outputs.max(1)
+
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    epoch_loss = running_loss / len(dataloader)
+    epoch_acc = 100. * correct / total
+
+    return epoch_loss, epoch_acc, all_preds, all_labels
+
+
+# ============================================================================
+# 4. Основная функция
+# ============================================================================
+def main():
+    # Параметры
+    DATA_DIR = './capsule_data'  # Путь к данным
+    BATCH_SIZE = 32
+    EPOCHS = 20
+    LEARNING_RATE = 0.001
+    IMG_SIZE = 224
+
+    # Устройство (GPU если доступно)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    # Аугментация и трансформации
+    train_transform = transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(10),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+
+    test_transform = transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+
+    # Создание датасетов
+    try:
+        train_dataset = CapsuleEndoscopyDataset(
+            DATA_DIR,
+            transform=train_transform,
+            mode='train'
+        )
+        test_dataset = CapsuleEndoscopyDataset(
+            DATA_DIR,
+            transform=test_transform,
+            mode='test'
+        )
+
+        print(f"Train samples: {len(train_dataset)}")
+        print(f"Test samples: {len(test_dataset)}")
+
+        # Если данных нет, создаем синтетические данные для демонстрации
+        if len(train_dataset) == 0:
+            raise FileNotFoundError("No data found. Please check data directory.")
+
+    except FileNotFoundError:
+        print("Warning: No data directory found. Creating synthetic example...")
+        # В реальном проекте здесь должен быть ваш реальный датасет
+        return
+
+    # DataLoader
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=2
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=2
+    )
+
+    # Инициализация модели
+    model = TumorDetectorCNN(num_classes=2, use_pretrained=True)
+    model = model.to(device)
+
+    # Функция потерь и оптимизатор
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+
+    # Обучение
+    print("Starting training...")
+    best_acc = 0.0
+
+    train_history = {'loss': [], 'acc': []}
+    val_history = {'loss': [], 'acc': []}
+
+    for epoch in range(EPOCHS):
+        print(f"\nEpoch {epoch + 1}/{EPOCHS}")
+        print("-" * 50)
+
+        # Обучение
+        train_loss, train_acc = train_epoch(
+            model, train_loader, criterion, optimizer, device
+        )
+
+        # Валидация
+        val_loss, val_acc, _, _ = validate(
+            model, test_loader, criterion, device
+        )
+
+        # Обновление LR
+        scheduler.step()
+
+        # Сохранение истории
+        train_history['loss'].append(train_loss)
+        train_history['acc'].append(train_acc)
+        val_history['loss'].append(val_loss)
+        val_history['acc'].append(val_acc)
+
+        print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
+        print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+
+        # Сохранение лучшей модели
+        if val_acc > best_acc:
+            best_acc = val_acc
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_acc': val_acc,
+            }, 'best_tumor_detector.pth')
+            print("Model saved!")
+
+    # ============================================================================
+    # 5. Оценка модели
+    # ============================================================================
+    print("\n" + "=" * 50)
+    print("Final Evaluation")
+    print("=" * 50)
+
+    # Загрузка лучшей модели
+    checkpoint = torch.load('best_tumor_detector.pth')
+    model.load_state_dict(checkpoint['model_state_dict'])
+
+    # Финальная оценка
+    test_loss, test_acc, all_preds, all_labels = validate(
+        model, test_loader, criterion, device
+    )
+
+    print(f"Test Accuracy: {test_acc:.2f}%")
+
+    # Отчет классификации
+    print("\nClassification Report:")
+    print(classification_report(all_labels, all_preds,
+                                target_names=['Normal', 'Tumor']))
+
+    # Матрица ошибок
+    cm = confusion_matrix(all_labels, all_preds)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=['Normal', 'Tumor'],
+                yticklabels=['Normal', 'Tumor'])
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title('Confusion Matrix')
+    plt.savefig('confusion_matrix.png')
+    plt.show()
+
+    # ============================================================================
+    # 6. Функция для предсказания на новых изображениях
+    # ============================================================================
+    def predict_image(image_path, model, transform, device):
+        """Предсказание для одного изображения"""
+        model.eval()
+
+        # Загрузка и обработка изображения
+        image = Image.open(image_path).convert('RGB')
+        image_tensor = transform(image).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            outputs = model(image_tensor)
+            probabilities = torch.nn.functional.softmax(outputs, dim=1)
+            _, predicted = torch.max(outputs, 1)
+
+        confidence = probabilities[0][predicted.item()].item()
+        class_name = 'Tumor' if predicted.item() == 1 else 'Normal'
+
+        return class_name, confidence
+
+    # Пример использования предсказания
+    print("\n" + "=" * 50)
+    print("Prediction Example")
+    print("=" * 50)
+
+    # Проверяем наличие тестового изображения
+    if len(test_dataset) > 0:
+        sample_img, sample_label = test_dataset[0]
+        sample_path = test_dataset.images[0]
+
+        class_name, confidence = predict_image(
+            sample_path, model, test_transform, device
+        )
+
+        print(f"Image: {os.path.basename(sample_path)}")
+        print(f"True label: {'Tumor' if sample_label == 1 else 'Normal'}")
+        print(f"Predicted: {class_name} (confidence: {confidence:.2%})")
+
+
+# ============================================================================
+# 7. Вспомогательные функции для анализа
+# ============================================================================
+def analyze_predictions(model, dataloader, device, num_samples=5):
+    """Анализ предсказаний модели"""
+    model.eval()
+    samples = []
+
+    with torch.no_grad():
+        for i, (inputs, labels) in enumerate(dataloader):
+            if i >= num_samples:
+                break
+
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            probabilities = torch.nn.functional.softmax(outputs, dim=1)
+
+            for j in range(inputs.size(0)):
+                if j >= num_samples:
+                    break
+
+                pred_class = torch.argmax(outputs[j]).item()
+                true_class = labels[j].item()
+                confidence = probabilities[j][pred_class].item()
+
+                samples.append({
+                    'input': inputs[j].cpu(),
+                    'true_class': true_class,
+                    'pred_class': pred_class,
+                    'confidence': confidence
+                })
+
+    return samples
+
+
+def create_gradcam_visualization(model, image_tensor, device):
+    """Визуализация с использованием Grad-CAM"""
+    # Реализация Grad-CAM для интерпретации решений модели
+    pass
+
+
+# ============================================================================
+# Запуск
+# ============================================================================
+if __name__ == "__main__":
+    # Проверка зависимостей
+    required_libraries = ['torch', 'torchvision', 'PIL', 'matplotlib', 'seaborn', 'scikit-learn']
+
+    print("Checking dependencies...")
+    for lib in required_libraries:
+        try:
+            __import__(lib.replace('-', '_'))
+            print(f"✓ {lib}")
+        except ImportError:
+            print(f"✗ {lib} not installed")
+
+    print("\n" + "=" * 50)
+    print("Capsule Endoscopy Tumor Detection")
+    print("=" * 50)
+
+    main()
