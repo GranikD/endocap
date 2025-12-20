@@ -1,0 +1,20 @@
+от основы:
+pip install torch torchvision torchaudio
+pip install opencv-python
+pip install monai
+pip install albumentations numpy matplotlib
+
+от тренировки нейронки:
+pip install torch torchvision torchaudio
+pip install monai
+pip install opencv-python
+pip install albumentations
+pip install numpy matplotlib tqdm
+pip install scikit-learn  # Для метрик
+
+от оптимизации капсулы:
+pip install torch torchvision torchaudio
+pip install tensorflow>=2.13.0  # Для TFLite конвертера
+pip install onnx onnxruntime
+pip install tf2onnx  # PyTorch -> ONNX -> TFLite
+pip install monai
