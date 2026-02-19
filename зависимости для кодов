@@ -1,1 +1,0 @@
-pip install torch torchvision opencv-python albumentations tqdm
