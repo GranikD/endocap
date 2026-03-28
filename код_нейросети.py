@@ -1,183 +1,139 @@
 import os
-import pandas as pd
+import time
+import threading
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms, models
+from torchvision import models, transforms
 from PIL import Image
-from sklearn.model_selection import train_test_split
-from tqdm import tqdm
+from flask import Flask, request, render_template_string
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
-# Укажите путь к распакованному датасету HyperKvasir
-DATA_ROOT = './hyperkvasir-dataset'
-CSV_FILE = os.path.join(DATA_ROOT, 'kvasir_v2.csv')  # Или название вашего csv файла с метками
-IMAGE_FOLDER = os.path.join(DATA_ROOT, 'labeled-images')
+MODEL_PATH = r'kvasir_resnet50_final.pth' 
+BLUETOOTH_FOLDER = r'C:\Bluetooth_Photos' 
 
-BATCH_SIZE = 32
-LEARNING_RATE = 0.001
-NUM_EPOCHS = 10
+class_names = [
+    'barretts', 'barretts-short-segment', 'bbps-0-1', 'bbps-2-3', 'cecum',
+    'dyed-lifted-polyps', 'dyed-resection-margins', 'esophagitis-a',
+    'esophagitis-b-d', 'hemorrhoids', 'ileum', 'impacted-stool', 'polyps',
+    'pylorus', 'retroflex-rectum', 'retroflex-stomach', 'ulcerative-colitis-grade-0-1',
+    'ulcerative-colitis-grade-1', 'ulcerative-colitis-grade-1-2', 'ulcerative-colitis-grade-2',
+    'ulcerative-colitis-grade-2-3', 'ulcerative-colitis-grade-3', 'z-line'
+]
+
+translate_dict = {
+    'barretts': 'Пищевод Барретта',
+    'barretts-short-segment': 'Пищевод Барретта (короткий сегмент)',
+    'bbps-0-1': 'Низкое качество очистки (BBPS 0-1)',
+    'bbps-2-3': 'Высокое качество очистки (BBPS 2-3)',
+    'cecum': 'Слепая кишка (норма)',
+    'dyed-lifted-polyps': 'Полип (маркировка красителем)',
+    'dyed-resection-margins': 'Зона резекции (после удаления)',
+    'esophagitis-a': 'Эзофагит (стадия А)',
+    'esophagitis-b-d': 'Эзофагит (стадии B-D)',
+    'hemorrhoids': 'Геморрой',
+    'ileum': 'Подвздошная кишка (норма)',
+    'impacted-stool': 'Загрязнение каловыми массами',
+    'polyps': 'Полип',
+    'pylorus': 'Привратник желудка (норма)',
+    'retroflex-rectum': 'Прямая кишка (ретрофлексия)',
+    'retroflex-stomach': 'Желудок (ретрофлексия)',
+    'ulcerative-colitis-grade-0-1': 'Язвенный колит (стадия 0-1)',
+    'ulcerative-colitis-grade-1': 'Язвенный колит (стадия 1)',
+    'ulcerative-colitis-grade-1-2': 'Язвенный колит (стадия 1-2)',
+    'ulcerative-colitis-grade-2': 'Язвенный колит (стадия 2)',
+    'ulcerative-colitis-grade-2-3': 'Язвенный колит (стадия 2-3)',
+    'ulcerative-colitis-grade-3': 'Язвенный колит (стадия 3)',
+    'z-line': 'Z-линия (переход в желудок)'
+}
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+app = Flask(__name__)
+model = None
 
-print(f"Используется устройство: {DEVICE}")
-
-
-# 1. ПОДГОТОВКА ДАТАСЕТА
-
-class KvasirDataset(Dataset):
-    def init(self, dataframe, root_dir, transform=None):
-        self.dataframe = dataframe
-        self.root_dir = root_dir
-        self.transform = transform
-
-        # Создаем словарь классов (строки -> числа)
-        self.classes = self.dataframe['label'].unique()  # Убедитесь, что колонка называется 'label' или 'class'
-        self.class_to_idx = {cls_name: idx for idx, cls_name in enumerate(self.classes)}
-
-    def len(self):
-        return len(self.dataframe)
-
-    def getitem(self, idx):
-        # Получаем имя файла (в HyperKvasir это часто просто ID или путь)
-        img_name = str(self.dataframe.iloc[idx]['image_id'])
-        # Добавляем расширение, если его нет в csv (проверьте ваш csv)
-        if not img_name.endswith('.jpg'):
-            img_name += '.jpg'
-
-        img_path = os.path.join(self.root_dir, self.dataframe.iloc[idx]['folder_name'],
-                                img_name)  # folder_name часто есть в csv
-
-        # Загрузка изображения
-        try:
-            image = Image.open(img_path).convert("RGB")
-        except FileNotFoundError:
-            # Заглушка на случай битого пути (для безопасности)
-            image = Image.new('RGB', (224, 224))
-
-        label_name = self.dataframe.iloc[idx]['label']
-        label = self.class_to_idx[label_name]
-
-        if self.transform:
-            image = self.transform(image)
-
-        return image, label
-
-
-# 2. ЗАГРУЗКА И ОБРАБОТКА ДАННЫХ
-
-# Читаем CSV
-# Примечание: Вам нужно отфильтровать CSV, если вы ищете ТОЛЬКО опухоли.
-# Например: df = df[df['label'].isin(['polyps', 'normal-z-line'])]
-try:
-    df = pd.read_csv(CSV_FILE)  # Убедитесь, что разделитель верный (запятая или точка с запятой)
-except FileNotFoundError:
-    print("CSV файл не найден. Создаем фиктивный DataFrame для примера кода.")
-    data = {'image_id': ['test1', 'test2'], 'label': ['polyp', 'normal'], 'folder_name': ['polyps', 'normal']}
-    df = pd.DataFrame(data)
-
-# Разделение на train/val
-train_df, val_df = train_test_split(df, test_size=0.2, stratify=df['label'], random_state=42)
-
-# Аугментация изображений (Важно для медицинских данных!)
-train_transforms = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomRotation(10),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-])
-
-val_transforms = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-])
-
-train_dataset = KvasirDataset(train_df, IMAGE_FOLDER, transform=train_transforms)
-val_dataset = KvasirDataset(val_df, IMAGE_FOLDER, transform=val_transforms)
-
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-
-# 3. СОЗДАНИЕ МОДЕЛИ
-def get_model(num_classes):
-    # Загружаем предобученную модель
-    model = models.resnet18(pretrained=True)
-
-
-
-    # Заменяем последний слой под количество наших классов
-    num_ftrs = model.fc.in_features
-    model.fc = nn.Linear(num_ftrs, num_classes)
-    return model
-
-
-num_classes = len(train_dataset.classes)
-model = get_model(num_classes).to(DEVICE)
-
-# 4. ОБУЧЕНИЕ
-
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-
-
-def train_one_epoch(epoch_index):
-    model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
-
-    loop = tqdm(train_loader, desc=f"Epoch {epoch_index + 1}/{NUM_EPOCHS}")
-
-    for images, labels in loop:
-        images, labels = images.to(DEVICE), labels.to(DEVICE)
-
-        # Zero gradients
-        optimizer.zero_grad()
-
-        # Forward
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-
-        # Backward
-        loss.backward()
-        optimizer.step()
-
-        # Metrics
-        running_loss += loss.item()
-        _, predicted = torch.max(outputs.data, 1)
-        total += labels.size(0)
-        correct += (predicted == labels).sum().item()
-
-        loop.set_postfix(loss=loss.item())
-
-    epoch_acc = 100 * correct / total
-    print(f"Epoch {epoch_index + 1} Result: Loss: {running_loss / len(train_loader):.4f}, Acc: {epoch_acc:.2f}%")
-
-
-def validate():
+def load_model():
+    global model
+    model = models.resnet50()
+    model.fc = nn.Linear(model.fc.in_features, len(class_names))
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(f"Файл {MODEL_PATH} не найден!")
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE, weights_only=True))
+    model.to(DEVICE)
     model.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for images, labels in val_loader:
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
-            outputs = model(images)
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
 
-    print(f"Validation Accuracy: {100 * correct / total:.2f}%")
-    print("-" * 20)
+def predict_image(image_obj):
+    preprocess = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    try:
+        img = Image.open(image_obj).convert('RGB')
+        img_tensor = preprocess(img).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            output = model(img_tensor)
+            probs = torch.nn.functional.softmax(output[0], dim=0)
+            conf, index = torch.max(probs, 0)
+        class_en = class_names[index.item()]
+        class_ru = translate_dict.get(class_en, class_en)
+        return class_ru, conf.item() * 100
+    except Exception as e:
+        return f"Ошибка: {e}", 0
 
+class BluetoothHandler(FileSystemEventHandler):
+    def on_created(self, event):
+        if not event.is_directory and event.src_path.lower().endswith(('.png', '.jpg', '.jpeg')):
+            time.sleep(1)
+            result_ru, conf = predict_image(event.src_path)
+            print(f"Bluetooth Result: {result_ru} ({conf:.2f}%)")
 
-# Запуск цикла обучения
+def start_bluetooth_watcher():
+    if not os.path.exists(BLUETOOTH_FOLDER):
+        os.makedirs(BLUETOOTH_FOLDER)
+    observer = Observer()
+    observer.schedule(BluetoothHandler(), BLUETOOTH_FOLDER, recursive=False)
+    observer.start()
 
-print(f"Начинаем обучение на {num_classes} классов: {train_dataset.classes}")
-for epoch in range(NUM_EPOCHS):
-    train_one_epoch(epoch)
-    validate()
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Нейросеть Эндоскопии</title>
+    <style>
+        body { font-family: Arial; margin: 40px; background: #f0f2f5; }
+        .box { max-width: 500px; margin: auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
+        .result { margin-top: 20px; padding: 15px; background: #e8f5e9; border-left: 5px solid #4caf50; }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h2>Анализ снимка</h2>
+        <form method="post" enctype="multipart/form-data">
+            <input type="file" name="file" accept="image/*" required>
+            <button type="submit" style="margin-top: 10px; padding: 8px;">Анализировать</button>
+        </form>
+        {% if result %}
+        <div class="result">
+            <h3>Диагноз: {{ result }}</h3>
+            <p>Уверенность сети: <b>{{ conf|round(2) }}%</b></p>
+        </div>
+        {% endif %}
+    </div>
+</body>
+</html>
+"""
 
-    # Сохранение модели
-    torch.save(model.state_dict(), 'gi_tumor_detector.pth')
-    print("Модель сохранена как gi_tumor_detector.pth")
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    result_ru, conf = None, None
+    if request.method == 'POST':
+        file = request.files['file']
+        if file:
+            result_ru, conf = predict_image(file.stream)
+    return render_template_string(HTML_TEMPLATE, result=result_ru, conf=conf)
+
+if __name__ == "__main__":
+    load_model()
+    bt_thread = threading.Thread(target=start_bluetooth_watcher, daemon=True)
+    bt_thread.start()
+    app.run(host='0.0.0.0', port=5000, debug=False)
